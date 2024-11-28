@@ -1,31 +1,54 @@
-import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs";
+import { clerkMiddleware } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
+import { Role } from "@prisma/client";
+import { PrismaClient } from "@prisma/client/edge";
+import { withAccelerate } from "@prisma/extension-accelerate";
 
-export async function middleware(req: NextRequest) {
-  const res = NextResponse.next();
-  const supabase = createMiddlewareClient({ req, res });
+// Initialize Prisma with Accelerate
+const prisma = new PrismaClient().$extends(withAccelerate());
 
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
+const routePermissions: Record<string, Role[]> = {
+  "/admin": [Role.ADMIN],
+  "/manager": [Role.ADMIN, Role.MANAGER],
+  "/profile": [Role.ADMIN, Role.MANAGER, Role.CUSTOMER],
+};
 
-  if (session) {
-    if (
-      req.nextUrl.pathname === "/sign-in" ||
-      req.nextUrl.pathname === "/sign-up"
-    ) {
-      return NextResponse.redirect(new URL("/dashboard", req.url));
-    }
-  } else {
-    if (req.nextUrl.pathname.startsWith("/dashboard")) {
+export default clerkMiddleware(async (auth, req) => {
+  const { userId } = await auth.protect();
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { clerkId: userId },
+      select: { role: true },
+    });
+
+    if (!user) {
       return NextResponse.redirect(new URL("/sign-in", req.url));
     }
-  }
 
-  return res;
-}
+    const path = req.nextUrl.pathname;
+    const requiredRoles = Object.entries(routePermissions).find(([route]) =>
+      path.startsWith(route)
+    )?.[1];
+
+    if (requiredRoles && !requiredRoles.includes(user.role)) {
+      return NextResponse.redirect(new URL("/unauthorized", req.url));
+    }
+
+    return NextResponse.next();
+  } catch (error) {
+    console.error("Middleware error:", error);
+    return NextResponse.redirect(new URL("/sign-in", req.url));
+  } finally {
+    await prisma.$disconnect();
+  }
+});
 
 export const config = {
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
+  matcher: [
+    "/admin/:path*",
+    "/manager/:path*",
+    "/profile/:path*",
+    "/((?!.+\\.[\\w]+$|_next|sign-in|sign-up).*)",
+  ],
 };
